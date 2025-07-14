@@ -394,10 +394,29 @@ static struct {
 	int (UTRACY_WINDOWS_STDCALL UTRACY_LINUX_CDECL *orig_server_tick)(void);
 	void *send_maps;
 	void (UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL *orig_send_maps)(void);
+
+	void *erasure;
+	int unsigned (UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL *orig_erasure)(struct object, int unsigned);
+	void *event_io;
+#if defined(UTRACY_WINDOWS)
+	int (UTRACY_WINDOWS_THISCALL *orig_event_io)(void *, short unsigned, long);
+#elif defined(UTRACY_LINUX)
+	int (UTRACY_LINUX_THISCALL *orig_event_io)(void *);
+#endif
+	void *make_string;
+	char *(UTRACY_WINDOWS_CDECL UTRACY_LINUX_REGPARM(3) *orig_make_string)(char *, char, char, char);
+	void *rebalance_strings;
+	void (UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL *orig_rebalance_strings)(void);
+
 	_Alignas(UTRACY_PAGE_SIZE) struct {
 		char exec_proc[32];
 		char server_tick[32];
 		char send_maps[32];
+
+		char erasure[32];
+		char event_io[32];
+		char make_string[32];
+		char rebalance_strings[32];
 	} trampoline;
 } byond;
 
@@ -779,7 +798,7 @@ struct utracy_source_location {
 	int unsigned color;
 };
 
-static struct utracy_source_location srclocs[0x14002];
+static struct utracy_source_location srclocs[0x14006];
 
 UTRACY_INTERNAL UTRACY_INLINE
 void utracy_emit_zone_begin(int unsigned proc) {
@@ -1046,6 +1065,46 @@ void UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL send_maps(void) {
 	utracy_emit_zone_end();
 }
 
+UTRACY_INTERNAL
+int unsigned UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL erasure(struct object src, int unsigned refcount) {
+	utracy_emit_zone_begin(0x14002);
+	int unsigned result = byond.orig_erasure(src, refcount);
+	utracy_emit_zone_end();
+	return result;
+}
+
+UTRACY_INTERNAL
+#if defined(UTRACY_WINDOWS)
+int UTRACY_WINDOWS_THISCALL event_io(void *this, short unsigned unk, long socket) {
+#elif defined(UTRACY_LINUX)
+int UTRACY_LINUX_THISCALL event_io(void *this) {
+#endif
+	utracy_emit_zone_begin(0x14003);
+
+#if defined(UTRACY_WINDOWS)
+	int result = byond.orig_event_io(this, unk, socket);
+#elif defined(UTRACY_LINUX)
+	int result = byond.orig_event_io(this);
+#endif
+
+	utracy_emit_zone_end();
+	return result;
+}
+
+UTRACY_INTERNAL
+char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_REGPARM(3) make_string(char *str, char unk0, char unk1, char unk2) {
+	utracy_emit_zone_begin(0x14004);
+	char *result = byond.orig_make_string(str, unk0, unk1, unk2);
+	utracy_emit_zone_end();
+	return result;
+}
+
+void UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL rebalance_strings(void) {
+	utracy_emit_zone_begin(0x14005);
+	byond.orig_rebalance_strings();
+	utracy_emit_zone_end();
+}
+
 /* hooking */
 UTRACY_INTERNAL
 void *hook(char *const restrict dst, char *const restrict src, char unsigned size, char *trampoline) {
@@ -1181,6 +1240,38 @@ void build_srclocs(void) {
 		.color = 0x44AF44
 	};
 
+	srclocs[0x14002] = (struct utracy_source_location) {
+		.name = NULL,
+		.function = "Erasure",
+		.file = __FILE__,
+		.line = __LINE__,
+		.color = 0x44AF44
+	};
+
+	srclocs[0x14003] = (struct utracy_source_location) {
+		.name = NULL,
+		.function = "SocketLib::Event_io",
+		.file = __FILE__,
+		.line = __LINE__,
+		.color = 0x44AF44
+	};
+
+	srclocs[0x14004] = (struct utracy_source_location) {
+		.name = NULL,
+		.function = "MakeString",
+		.file = __FILE__,
+		.line = __LINE__,
+		.color = 0x44AF44
+	};
+
+	srclocs[0x14005] = (struct utracy_source_location) {
+		.name = NULL,
+		.function = "RebalanceStrings",
+		.file = __FILE__,
+		.line = __LINE__,
+		.color = 0x44AF44
+	};
+
 #undef byond_get_string
 #undef byond_get_misc
 #undef byond_get_procdef
@@ -1259,7 +1350,7 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 
 	int unsigned const *const offsets = byond_offsets[BYOND_VERSION_ADJUSTED(byond_build)];
 
-	for(int i=0; i<11; i++) {
+	for(int i=0; i<16; i++) {
 		if(offsets[i] == 0) {
 			LOG_DEBUG_ERROR;
 			return "byond version unsupported";
@@ -1267,6 +1358,7 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 	}
 
 	char unsigned prologues[3];
+	char unsigned prologues2[4];
 
 #if defined(UTRACY_WINDOWS)
 	byond.strings = (void *) (byondcore + offsets[0]);
@@ -1285,6 +1377,15 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 	prologues[1] = (offsets[10] >> 8) & 0xFF;
 	prologues[2] = (offsets[10] >> 16) & 0xFF;
 
+	byond.erasure = (void *) (byondcore + offsets[11]);
+	byond.event_io = (void *) (byondcore + offsets[12]);
+	byond.make_string = (void *) (byondcore + offsets[13]);
+	byond.rebalance_strings = (void *) (byondcore + offsets[14]);
+	prologues2[0] = (offsets[15] >> 0) & 0xFF;
+	prologues2[1] = (offsets[15] >> 8) & 0xFF;
+	prologues2[2] = (offsets[15] >> 16) & 0xFF;
+	prologues2[3] = (offsets[15] >> 24) & 0xFF;
+
 #elif defined(UTRACY_LINUX)
 	byond.strings = (void *) (libbyond->l_addr + offsets[0]);
 	byond.strings_len = (void *) (libbyond->l_addr + offsets[1]);
@@ -1301,6 +1402,15 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 	prologues[0] = (offsets[10] >> 0) & 0xFF;
 	prologues[1] = (offsets[10] >> 8) & 0xFF;
 	prologues[2] = (offsets[10] >> 16) & 0xFF;
+
+	byond.erasure = (void *) (libbyond->l_addr + offsets[11]);
+	byond.event_io = (void *) (libbyond->l_addr + offsets[12]);
+	byond.make_string = (void *) (libbyond->l_addr + offsets[13]);
+	byond.rebalance_strings = (void *) (libbyond->l_addr + offsets[14]);
+	prologues2[0] = (offsets[15] >> 0) & 0xFF;
+	prologues2[1] = (offsets[15] >> 8) & 0xFF;
+	prologues2[2] = (offsets[15] >> 16) & 0xFF;
+	prologues2[3] = (offsets[15] >> 24) & 0xFF;
 
 #endif
 
@@ -1322,6 +1432,30 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 	if(NULL == byond.orig_send_maps) {
 		LOG_DEBUG_ERROR;
 		return "failed to hook send_maps";
+	}
+
+	byond.orig_erasure = hook((void *) erasure, byond.erasure, prologues2[0], byond.trampoline.erasure);
+	if(NULL == byond.orig_erasure) {
+		LOG_DEBUG_ERROR;
+		return "failed to hook erasure";
+	}
+
+	byond.orig_event_io = hook((void *) event_io, byond.event_io, prologues2[1], byond.trampoline.event_io);
+	if(NULL == byond.orig_event_io) {
+		LOG_DEBUG_ERROR;
+		return "failed to hook event_io";
+	}
+
+	byond.orig_make_string = hook((void *) make_string, byond.make_string, prologues2[2], byond.trampoline.make_string);
+	if(NULL == byond.orig_make_string) {
+		LOG_DEBUG_ERROR;
+		return "failed to hook make_string";
+	}
+
+	byond.orig_rebalance_strings = hook((void *) rebalance_strings, byond.rebalance_strings, prologues2[3], byond.trampoline.rebalance_strings);
+	if(NULL == byond.orig_rebalance_strings) {
+		LOG_DEBUG_ERROR;
+		return "failed to hook rebalance_strings";
 	}
 
 #if defined(UTRACY_WINDOWS)
