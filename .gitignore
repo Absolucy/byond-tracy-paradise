@@ -3,3 +3,6 @@ libprof.*
 !prof.c
 /.vs
 /build
+
+zeekstdc.*
+libzeekstdc.*

@@ -226,6 +226,17 @@ size_t strlen(char const *const a) {
 #endif
 
 
+#if defined(UTRACY_COMPRESSED)
+#	include <stdarg.h>
+#	include <stdint.h>
+
+	void *zs_open_file(const char *file_name, int32_t compression_level);
+	bool zs_write(void *encoder, const uint8_t *data, uintptr_t len);
+	bool zs_flush(void *encoder);
+	uint64_t zs_finish(void *encoder);
+	const char *zs_last_error();
+#endif
+
 /* debugging */
 #if defined(UTRACY_DEBUG) || defined(DEBUG)
 #	include <stdio.h>
@@ -415,7 +426,7 @@ static struct {
 	thrd_t thread;
     event_pipe_t* quit;
 
-	FILE* fstream;
+	void* fstream;
 
 	struct {
 		int unsigned producer_tail_cache;
@@ -865,25 +876,35 @@ int utracy_write(void const *const buf, size_t size) {
 #else
 UTRACY_INTERNAL
 int utracy_write(void const *const buf, size_t size) {
-	if(utracy.fstream != NULL) fwrite(buf, 1, size, utracy.fstream);
+	if(utracy.fstream != NULL) {
+#if defined(UTRACY_COMPRESSED)
+		zs_write(utracy.fstream, buf, size);
+#else
+		fwrite(buf, 1, size, utracy.fstream);
+#endif
+	}
 	return 0;
 }
 #endif
 
 UTRACY_INTERNAL
-void utracy_flush(FILE* stream) {
+void utracy_flush(void* stream) {
 	if(stream == NULL) {
 		if(utracy.fstream == NULL) {
 			return;
 		}
 		stream = utracy.fstream;
 	}
+#if defined(UTRACY_COMPRESSED)
+	zs_flush(stream);
+#else
 	int fd = _fileno(stream);
 	if(fd == -1) return;
 #if defined(UTRACY_WINDOWS)
 	_commit(fd);
 #elif defined(UTRACY_LINUX)
 	fsync(fd);
+#endif
 #endif
 }
 
@@ -996,7 +1017,11 @@ int utracy_server_thread_start(void* arg) {
 		}
 	}
 
+#if defined(UTRACY_COMPRESSED)
+	zs_flush(utracy.fstream);
+#else
 	utracy_flush(NULL);
+#endif
 	close_event_pipe(utracy.quit);
 	utracy.quit = NULL;
 	return 0;
@@ -1384,11 +1409,20 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 
 	static char ffilename[MAX_PATH];
 	memset(ffilename, 0, MAX_PATH);
+#if defined(UTRACY_COMPRESSED)
+	snprintf(ffilename, MAX_PATH, "./data/profiler/%llu.utracy.zst", utracy_tsc());
+	utracy.fstream = zs_open_file(ffilename, 3);
+#else
 	snprintf(ffilename, MAX_PATH, "./data/profiler/%llu.utracy", utracy_tsc());
 	utracy.fstream = fopen(ffilename, "wb");
+#endif
 	if(NULL == utracy.fstream) {
 		LOG_DEBUG_ERROR;
+#if defined(UTRACY_COMPRESSED)
+		return (char*)zs_last_error();
+#else
 		return "fopen failed";
+#endif
 	}
 
 	utracy.info.resolution = calibrate_resolution();
@@ -1444,10 +1478,17 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL destroy(int argc, char **argv) {
 
     close_event_pipe(utracy.quit);
 	utracy.quit = NULL;
-	FILE* fstream = utracy.fstream;
+	void* fstream = utracy.fstream;
 	utracy.fstream = NULL;
+#if defined(UTRACY_COMPRESSED)
+    if(zs_finish(fstream) == 0) {
+		initialized = false;
+		return (char*)zs_last_error();
+	}
+#else
 	utracy_flush(fstream);
     fclose(fstream);
+#endif
     initialized = false;
 
     return "0";
@@ -1466,6 +1507,7 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL flush(int argc, char **argv) {
 		return "already shutting down";
 	}
 
+#if !defined(UTRACY_COMPRESSED)
 	// Then ensure it's written to disk
 	int fd = _fileno(utracy.fstream);
 	if(fd == -1) {
@@ -1484,6 +1526,9 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL flush(int argc, char **argv) {
 		return "failed to sync file to disk";
 	}
 #endif
+#endif
+
+	//zs_flush(utracy.fstream);
 
 	return "0";
 }
