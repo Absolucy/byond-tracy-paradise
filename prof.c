@@ -132,6 +132,7 @@ char *getenv(char const *);
 #include <stdbool.h>
 #include <threads.h>
 #include <stdatomic.h>
+#include <stdint.h>
 
 #if (__STDC_HOSTED__ == 1)
 #	include <stdlib.h>
@@ -226,16 +227,11 @@ size_t strlen(char const *const a) {
 #endif
 
 
-#if defined(UTRACY_COMPRESSED)
-#	include <stdarg.h>
-#	include <stdint.h>
-
-	void *zs_open_file(const char *file_name, int32_t compression_level);
-	bool zs_write(void *encoder, const uint8_t *data, uintptr_t len);
-	bool zs_flush(void *encoder);
-	uint64_t zs_finish(void *encoder);
-	const char *zs_last_error();
-#endif
+typedef void *(UTRACY_WINDOWS_CDECL *zs_open_file_func)(const char *file_name, int32_t compression_level);
+typedef bool (UTRACY_WINDOWS_CDECL *zs_write_func)(void *encoder, const uint8_t *data, uintptr_t len);
+typedef bool (UTRACY_WINDOWS_CDECL *zs_flush_func)(void *encoder);
+typedef uint64_t (UTRACY_WINDOWS_CDECL *zs_finish_func)(void *encoder);
+typedef const char *(UTRACY_WINDOWS_CDECL *zs_last_error_func)(void);
 
 /* debugging */
 #if defined(UTRACY_DEBUG) || defined(DEBUG)
@@ -413,6 +409,17 @@ static struct {
 } byond;
 
 static struct {
+	bool load_attempted;
+	bool available;
+	void *library;
+	zs_open_file_func zs_open_file;
+	zs_write_func zs_write;
+	zs_flush_func zs_flush;
+	zs_finish_func zs_finish;
+	zs_last_error_func zs_last_error;
+} compression;
+
+static struct {
 	struct {
 		long long init_begin;
 		long long init_end;
@@ -424,9 +431,10 @@ static struct {
 	} info;
 
 	thrd_t thread;
-    event_pipe_t* quit;
+	event_pipe_t* quit;
 
 	void* fstream;
+	bool fstream_compressed;
 
 	struct {
 		int unsigned producer_tail_cache;
@@ -438,6 +446,84 @@ static struct {
 		_Alignas(UTRACY_L1_LINE_SIZE) int padding;
 	} queue;
 } utracy;
+
+UTRACY_INTERNAL
+void *utracy_compression_open_library(void) {
+#if defined(UTRACY_WINDOWS)
+	return (void *) LoadLibraryA("zeekstdc.dll");
+#elif defined(UTRACY_LINUX)
+	return dlopen("libzeekstdc.so", RTLD_NOW);
+#endif
+}
+
+UTRACY_INTERNAL
+void utracy_compression_close_library(void) {
+	if(compression.library == NULL) {
+		return;
+	}
+
+#if defined(UTRACY_WINDOWS)
+	FreeLibrary((HMODULE) compression.library);
+#elif defined(UTRACY_LINUX)
+	dlclose(compression.library);
+#endif
+
+	compression.library = NULL;
+}
+
+UTRACY_INTERNAL
+void *utracy_compression_load_symbol(char const *const name) {
+	if(compression.library == NULL) {
+		return NULL;
+	}
+
+#if defined(UTRACY_WINDOWS)
+	return (void *) GetProcAddress((HMODULE) compression.library, name);
+#elif defined(UTRACY_LINUX)
+	return dlsym(compression.library, name);
+#endif
+}
+
+UTRACY_INTERNAL
+void utracy_compression_clear_symbols(void) {
+	compression.zs_open_file = NULL;
+	compression.zs_write = NULL;
+	compression.zs_flush = NULL;
+	compression.zs_finish = NULL;
+	compression.zs_last_error = NULL;
+}
+
+UTRACY_INTERNAL
+bool utracy_compression_try_load(void) {
+	if(compression.load_attempted) {
+		return compression.available;
+	}
+
+	compression.load_attempted = true;
+	compression.library = utracy_compression_open_library();
+	if(compression.library == NULL) {
+		return false;
+	}
+
+	compression.zs_open_file = (zs_open_file_func) utracy_compression_load_symbol("zs_open_file");
+	compression.zs_write = (zs_write_func) utracy_compression_load_symbol("zs_write");
+	compression.zs_flush = (zs_flush_func) utracy_compression_load_symbol("zs_flush");
+	compression.zs_finish = (zs_finish_func) utracy_compression_load_symbol("zs_finish");
+	compression.zs_last_error = (zs_last_error_func) utracy_compression_load_symbol("zs_last_error");
+
+	if(compression.zs_open_file == NULL
+		|| compression.zs_write == NULL
+		|| compression.zs_flush == NULL
+		|| compression.zs_finish == NULL
+		|| compression.zs_last_error == NULL) {
+		utracy_compression_close_library();
+		utracy_compression_clear_symbols();
+		return false;
+	}
+
+	compression.available = true;
+	return true;
+}
 
 event_pipe_t* create_event_pipe(bool manual_reset, bool initial_state) {
     event_pipe_t* pipe = malloc(sizeof(event_pipe_t));
@@ -877,35 +963,58 @@ int utracy_write(void const *const buf, size_t size) {
 UTRACY_INTERNAL
 int utracy_write(void const *const buf, size_t size) {
 	if(utracy.fstream != NULL) {
-#if defined(UTRACY_COMPRESSED)
-		zs_write(utracy.fstream, buf, size);
-#else
-		fwrite(buf, 1, size, utracy.fstream);
-#endif
+		if(utracy.fstream_compressed) {
+			if(!compression.zs_write(utracy.fstream, buf, (uintptr_t) size)) {
+				LOG_DEBUG_ERROR;
+				return -1;
+			}
+			return 0;
+		}
+
+		if(fwrite(buf, 1, size, utracy.fstream) != size) {
+			LOG_DEBUG_ERROR;
+			return -1;
+		}
 	}
 	return 0;
 }
 #endif
 
 UTRACY_INTERNAL
-void utracy_flush(void* stream) {
+int utracy_flush(void* stream) {
 	if(stream == NULL) {
 		if(utracy.fstream == NULL) {
-			return;
+			return 0;
 		}
 		stream = utracy.fstream;
 	}
-#if defined(UTRACY_COMPRESSED)
-	zs_flush(stream);
-#else
+
+	if(utracy.fstream_compressed) {
+		if(!compression.zs_flush(stream)) {
+			LOG_DEBUG_ERROR;
+			return -1;
+		}
+		return 0;
+	}
+
 	int fd = _fileno(stream);
-	if(fd == -1) return;
+	if(fd == -1) {
+		LOG_DEBUG_ERROR;
+		return -1;
+	}
 #if defined(UTRACY_WINDOWS)
-	_commit(fd);
+	if(_commit(fd) != 0) {
+		LOG_DEBUG_ERROR;
+		return -1;
+	}
 #elif defined(UTRACY_LINUX)
-	fsync(fd);
+	if(fsync(fd) != 0) {
+		LOG_DEBUG_ERROR;
+		return -1;
+	}
 #endif
-#endif
+
+	return 0;
 }
 
 UTRACY_INTERNAL
@@ -1017,11 +1126,7 @@ int utracy_server_thread_start(void* arg) {
 		}
 	}
 
-#if defined(UTRACY_COMPRESSED)
-	zs_flush(utracy.fstream);
-#else
-	utracy_flush(NULL);
-#endif
+	(void) utracy_flush(NULL);
 	close_event_pipe(utracy.quit);
 	utracy.quit = NULL;
 	return 0;
@@ -1409,20 +1514,21 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 
 	static char ffilename[MAX_PATH];
 	memset(ffilename, 0, MAX_PATH);
-#if defined(UTRACY_COMPRESSED)
-	snprintf(ffilename, MAX_PATH, "./data/profiler/%llu.utracy.zst", utracy_tsc());
-	utracy.fstream = zs_open_file(ffilename, 3);
-#else
-	snprintf(ffilename, MAX_PATH, "./data/profiler/%llu.utracy", utracy_tsc());
-	utracy.fstream = fopen(ffilename, "wb");
-#endif
+	utracy.fstream_compressed = utracy_compression_try_load();
+	if(utracy.fstream_compressed) {
+		snprintf(ffilename, MAX_PATH, "./data/profiler/%llu.utracy.zst", utracy_tsc());
+		utracy.fstream = compression.zs_open_file(ffilename, 3);
+	} else {
+		snprintf(ffilename, MAX_PATH, "./data/profiler/%llu.utracy", utracy_tsc());
+		utracy.fstream = fopen(ffilename, "wb");
+	}
 	if(NULL == utracy.fstream) {
 		LOG_DEBUG_ERROR;
-#if defined(UTRACY_COMPRESSED)
-		return (char*)zs_last_error();
-#else
+		if(utracy.fstream_compressed) {
+			char const *const error = compression.zs_last_error();
+			return (char *) (error != NULL ? error : "zs_open_file failed");
+		}
 		return "fopen failed";
-#endif
 	}
 
 	utracy.info.resolution = calibrate_resolution();
@@ -1479,16 +1585,22 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL destroy(int argc, char **argv) {
     close_event_pipe(utracy.quit);
 	utracy.quit = NULL;
 	void* fstream = utracy.fstream;
+	bool fstream_compressed = utracy.fstream_compressed;
 	utracy.fstream = NULL;
-#if defined(UTRACY_COMPRESSED)
-    if(zs_finish(fstream) == 0) {
-		initialized = false;
-		return (char*)zs_last_error();
+
+	if(fstream_compressed) {
+		if(compression.zs_finish(fstream) == 0) {
+			char const *const error = compression.zs_last_error();
+			initialized = false;
+			utracy.fstream_compressed = false;
+			return (char *) (error != NULL ? error : "zs_finish failed");
+		}
+	} else {
+		(void) utracy_flush(fstream);
+		fclose(fstream);
 	}
-#else
-	utracy_flush(fstream);
-    fclose(fstream);
-#endif
+
+	utracy.fstream_compressed = false;
     initialized = false;
 
     return "0";
@@ -1507,28 +1619,9 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL flush(int argc, char **argv) {
 		return "already shutting down";
 	}
 
-#if !defined(UTRACY_COMPRESSED)
-	// Then ensure it's written to disk
-	int fd = _fileno(utracy.fstream);
-	if(fd == -1) {
-		LOG_DEBUG_ERROR;
-		return "failed to get file descriptor";
+	if(0 != utracy_flush(utracy.fstream)) {
+		return utracy.fstream_compressed ? "failed to flush compressed stream" : "failed to sync file to disk";
 	}
-
-#if defined(UTRACY_WINDOWS)
-	if(_commit(fd) != 0) {
-		LOG_DEBUG_ERROR;
-		return "failed to commit file to disk";
-	}
-#elif defined(UTRACY_LINUX)
-	if(fsync(fd) != 0) {
-		LOG_DEBUG_ERROR;
-		return "failed to sync file to disk";
-	}
-#endif
-#endif
-
-	//zs_flush(utracy.fstream);
 
 	return "0";
 }

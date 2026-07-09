@@ -107,9 +107,7 @@ clang.exe -std=c11 -m32 -shared -Ofast3 -DNDEBUG -fuse-ld=lld-link prof.c -lws2_
 gcc -D_FILE_OFFSET_BITS=64 -std=c11 -m32 -shared -fPIC -Ofast -s -DNDEBUG prof.c -pthread -o libprof.so
 ```
 
-If you want to use the zstd compressed version, ensure that `libzeekstdc.a` or `libzeekstdc.so` (Linux), or `zeekstdc.dll`+`zeekstdc.dll.lib` (Windows) are in this directory (from https://github.com/Absolucy/zeekstdc), and add these to the compile command:
-- Windows: `-l"zeekstdc.dll.lib" -DUTRACY_COMPRESSED`
-- Linux: `-lzeekstdc -DUTRACY_COMPRESSED`
+If you want zstd-compressed output, make `zeekstdc.dll` (Windows) or `libzeekstdc.so` (Linux) available at runtime (from https://github.com/Absolucy/zeekstdc). No extra compile flags or link libraries are needed. When the library loads successfully, `init` returns a `.utracy.zst` path; otherwise it falls back to a normal `.utracy` path.
 
 ## remarks
 
